@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PlayerState {
-    pub id: String,
+    pub uuid: Uuid,
+    pub username: String,
     // position
     pub x: Option<f64>,
     pub y: Option<f64>,
@@ -24,13 +26,13 @@ pub struct PlayerState {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WorldState {
-    pub players: HashMap<String, PlayerState>,
+    pub players: HashMap<Uuid, PlayerState>,
 }
 
-pub fn generate_unique_name(world: &HashMap<String, PlayerState>, base: &str) -> String {
+pub fn generate_unique_name(world: &HashMap<Uuid, PlayerState>, base: &str) -> String {
     for i in 1..10000 {
         let candidate = format!("{}_{}", base, i);
-        if !world.contains_key(&candidate) {
+        if !world.values().any(|p| p.username == candidate) {
             return candidate;
         }
     }

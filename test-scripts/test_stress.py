@@ -31,8 +31,25 @@ def parse_server(addr: str) -> Tuple[str, int]:
 
 def client_worker(client_index: int, server_host: str, server_port: int, rate: float, duration: int, stats: dict):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(0.01)
-    my_id = f"stress_{client_index}_{random.randint(0,9999)}"
+    sock.settimeout(0.5)
+    my_name = f"stress_{client_index}_{random.randint(0,9999)}"
+
+    # register to obtain uuid
+    reg = {"type": "register", "username": my_name}
+    uuid = None
+    try:
+        sock.sendto(json.dumps(reg).encode("utf-8"), (server_host, server_port))
+        resp, _ = sock.recvfrom(4096)
+        r = json.loads(resp.decode("utf-8"))
+        if isinstance(r, dict) and r.get("action") == "registered":
+            uuid = r.get("uuid")
+            my_name = r.get("username", my_name)
+    except Exception:
+        uuid = None
+
+    if uuid is None:
+        stats[my_name] = {"sent": 0, "recv": 0, "latency_sum": 0.0, "errors": 1}
+        return
 
     # local simulated state
     x = random.random() * 5.0
@@ -57,7 +74,9 @@ def client_worker(client_index: int, server_host: str, server_port: int, rate: f
         z += vz * interval
 
         payload = {
-            "id": my_id,
+            "type": "update",
+            "uuid": uuid,
+            "username": my_name,
             "x": x,
             "y": y,
             "z": z,
@@ -73,9 +92,9 @@ def client_worker(client_index: int, server_host: str, server_port: int, rate: f
         except Exception:
             errors += 1
 
-        # listen briefly for broadcast and compute latency when we see our id
+        # listen briefly for broadcast and compute latency when we see our uuid
         t0 = time.time()
-        listen_deadline = t0 + 0.01
+        listen_deadline = t0 + 0.05
         while time.time() < listen_deadline:
             try:
                 data, _ = sock.recvfrom(8192)
@@ -92,8 +111,8 @@ def client_worker(client_index: int, server_host: str, server_port: int, rate: f
 
             if isinstance(obj, dict) and "players" in obj:
                 players = obj.get("players", {})
-                if my_id in players:
-                    p = players[my_id]
+                if uuid in players:
+                    p = players[uuid]
                     try:
                         client_ts = int(p.get("ts", ts))
                         now_ms = int(time.time() * 1000)
@@ -106,7 +125,7 @@ def client_worker(client_index: int, server_host: str, server_port: int, rate: f
         time.sleep(interval)
 
     # publish stats into shared dict
-    stats[my_id] = {"sent": sent, "recv": recvd, "latency_sum": latency_sum, "errors": errors}
+    stats[uuid] = {"sent": sent, "recv": recvd, "latency_sum": latency_sum, "errors": errors}
 
 
 def main():

@@ -11,50 +11,85 @@ SERVER_PORT = 8888
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-# ask user for a custom username before registering
-MY_NAME = input("请输入用户名: ").strip()
-if MY_NAME == "":
-    MY_NAME = "player_" + str(random.randint(1, 1000))
+# ask user for an optional existing uuid to resume
+EXISTING_UUID = input("如果有历史 uuid，请输入（回车跳过新建）: ").strip()
 
-print(f"尝试注册用户名: {MY_NAME}")
+UUID = None
+MY_NAME = None
+x = y = z = 0.0
+rx = ry = rz = 0.0
+vx = vy = vz = 0.1
 
 # register and obtain uuid
 sock.settimeout(2.0)
-reg = {"type": "register", "username": MY_NAME}
-sock.sendto(json.dumps(reg).encode('utf-8'), (SERVER_IP, SERVER_PORT))
-try:
-    resp, _ = sock.recvfrom(4096)
-    r = json.loads(resp.decode('utf-8'))
-    if isinstance(r, dict) and r.get('action') == 'name_conflict':
-        suggested = r.get('suggested')
-        print(f"服务器建议更名为 {suggested}")
-        MY_NAME = input(f"请输入新用户名（回车接收建议 {suggested}）: ").strip() or suggested
-        reg = {"type": "register", "username": MY_NAME}
-        sock.sendto(json.dumps(reg).encode('utf-8'), (SERVER_IP, SERVER_PORT))
+
+# try to resume with existing uuid if provided
+if EXISTING_UUID:
+    print(f"尝试恢复 uuid: {EXISTING_UUID}")
+    reg = {"type": "register", "username": "resume", "uuid": EXISTING_UUID}
+    sock.sendto(json.dumps(reg).encode('utf-8'), (SERVER_IP, SERVER_PORT))
+    try:
         resp, _ = sock.recvfrom(4096)
         r = json.loads(resp.decode('utf-8'))
-
-    if isinstance(r, dict) and r.get('action') == 'registered':
-        UUID = r.get('uuid')
-        print(f"已注册，uuid={UUID}")
-    else:
-        print("注册失败，继续使用临时用户名")
+        if isinstance(r, dict) and r.get('action') == 'registered':
+            UUID = r.get('uuid')
+            MY_NAME = r.get('username')
+            # resume prior state if provided
+            state = r.get('state') or {}
+            x = state.get('x', 0.0) or 0.0
+            y = state.get('y', 0.0) or 0.0
+            z = state.get('z', 0.0) or 0.0
+            rx = state.get('rx', 0.0) or 0.0
+            ry = state.get('ry', 0.0) or 0.0
+            rz = state.get('rz', 0.0) or 0.0
+            vx = state.get('vx', 0.1) or 0.1
+            vy = state.get('vy', 0.0) or 0.0
+            vz = state.get('vz', 0.0) or 0.0
+            print(f"恢复成功，uuid={UUID}, 用户名={MY_NAME}")
+    except socket.timeout:
+        print("恢复超时，尝试新建")
         UUID = None
-except socket.timeout:
-    print("注册无响应，继续使用临时用户名")
-    UUID = None
+
+# if resume failed or no uuid provided, ask for username and create new
+if not UUID:
+    MY_NAME = input("请输入用户名: ").strip()
+    if MY_NAME == "":
+        MY_NAME = "player_" + str(random.randint(1, 1000))
+    print(f"尝试新建用户名: {MY_NAME}")
+    
+    reg = {"type": "register", "username": MY_NAME}
+    sock.sendto(json.dumps(reg).encode('utf-8'), (SERVER_IP, SERVER_PORT))
+    try:
+        resp, _ = sock.recvfrom(4096)
+        r = json.loads(resp.decode('utf-8'))
+        if isinstance(r, dict) and r.get('action') == 'name_conflict':
+            suggested = r.get('suggested')
+            print(f"服务器建议更名为 {suggested}")
+            MY_NAME = input(f"请输入新用户名（回车接收建议 {suggested}）: ").strip() or suggested
+            reg = {"type": "register", "username": MY_NAME}
+            sock.sendto(json.dumps(reg).encode('utf-8'), (SERVER_IP, SERVER_PORT))
+            resp, _ = sock.recvfrom(4096)
+            r = json.loads(resp.decode('utf-8'))
+
+        if isinstance(r, dict) and r.get('action') == 'registered':
+            UUID = r.get('uuid')
+            print(f"已注册，uuid={UUID}, 用户名={MY_NAME}")
+        else:
+            print("注册失败，继续使用临时用户名")
+            UUID = None
+    except socket.timeout:
+        print("注册无响应，继续使用临时用户名")
+        UUID = None
 
 print(f"我是 {MY_NAME}, 开始发送三维位移/旋转/速度数据...")
 # 本地维护最近一次世界状态
 latest_world = {"players": {}}
 
 try:
-    # 3D position
-    x, y, z = 0.0, 0.0, 0.0
+    # 3D position (already initialized above)
     # rotation (Euler)
-    rx, ry, rz = 0.0, 0.0, 0.0
     # velocities
-    vx, vy, vz = 0.1, 0.0, 0.0
+
 
     last_heartbeat = time.time()
     while True:
@@ -108,11 +143,12 @@ try:
                 print(f"服务器返回世界状态: {len(players)} 个玩家在线")
                 # 打印每个玩家的 transform/velocity 简短信息
                 for pid, p in players.items():
-                    print(pid, {k: p.get(k) for k in ['x','y','z','rx','ry','rz','vx','vy','vz']})
+                    uname = p.get('username')
+                    print(f"{pid} ({uname})", {k: p.get(k) for k in ['x','y','z','rx','ry','rz','vx','vy','vz']})
             # 服务器要求纠正客户端位置
             elif isinstance(payload, dict) and payload.get('action') == 'correction':
                 corr = payload.get('corrected')
-                if isinstance(corr, dict) and corr.get('id') == MY_ID:
+                if isinstance(corr, dict) and corr.get('uuid') == UUID:
                     # apply correction
                     x = corr.get('x', x)
                     y = corr.get('y', y)
@@ -139,3 +175,5 @@ try:
         time.sleep(0.05)
 except KeyboardInterrupt:
     print("退出")
+finally:
+    print(f"客户端退出，uuid={UUID}")

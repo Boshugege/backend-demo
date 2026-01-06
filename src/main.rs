@@ -11,6 +11,13 @@ use rust_server::{PlayerState, WorldState, generate_unique_name};
 // `PlayerState`, `WorldState` and `generate_unique_name` are defined
 // in `src/lib.rs` and re-used by this binary.
 
+fn broadcast_world(socket: &UdpSocket, clients: &HashMap<Uuid, SocketAddr>, world: &WorldState) {
+    let payload = json!({"players": world.players}).to_string();
+    for addr in clients.values() {
+        let _ = socket.send_to(payload.as_bytes(), addr);
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let socket = UdpSocket::bind(("127.0.0.1", 8888))?;
     socket.set_nonblocking(true)?;
@@ -58,20 +65,15 @@ fn main() -> std::io::Result<()> {
                         let _ = socket_bg.send_to(notif.to_string().as_bytes(), addr);
                     }
                     // remove username mapping and world entry
-                    if let Some((uname, _)) = uname_map.iter().find(|(_, &u)| u == *uuid).map(|(k, &v)| (k.clone(), v)) {
-                        world.players.remove(&uname);
-                        uname_map.remove(&uname);
-                        println!("Removed {} due to timeout", uname);
+                    if let Some(player) = world.players.remove(uuid) {
+                        uname_map.remove(&player.username);
+                        println!("Removed {} due to timeout", player.username);
                     }
                     ls.remove(uuid);
                 }
 
                 // broadcast updated world after removals
-                let state = json!({"players": world.players});
-                let s = state.to_string();
-                for addr in clients.values() {
-                    let _ = socket_bg.send_to(s.as_bytes(), addr);
-                }
+                broadcast_world(&socket_bg, &clients, &world);
             }
         });
     }
@@ -104,12 +106,34 @@ fn main() -> std::io::Result<()> {
                             match t {
                                 "register" => {
                                     if let Some(uname) = val.get("username").and_then(|x| x.as_str()) {
+                                        let requested_uuid = val
+                                            .get("uuid")
+                                            .and_then(|x| x.as_str())
+                                            .and_then(|s| Uuid::parse_str(s).ok());
                                         let mut uname_map = username_map_clone.lock().unwrap();
                                         let mut clients = clients_clone.lock().unwrap();
                                         let mut ls = last_seen_clone.lock().unwrap();
                                         let mut world = world_clone.lock().unwrap();
 
-                                        if let Some(existing_uuid) = uname_map.get(uname) {
+                                        // resume if provided uuid exists server-side
+                                        if let Some(existing_uuid) = requested_uuid.and_then(|id| world.players.get(&id).map(|_| id)) {
+                                            let player = world.players.get(&existing_uuid).cloned().unwrap();
+                                            uname_map.insert(player.username.clone(), existing_uuid);
+                                            clients.insert(existing_uuid, src);
+                                            ls.insert(existing_uuid, Instant::now());
+
+                                            let resp = json!({
+                                                "action": "registered",
+                                                "uuid": existing_uuid,
+                                                "username": player.username,
+                                                "state": player,
+                                            });
+                                            let _ = socket_clone.send_to(resp.to_string().as_bytes(), src);
+                                            broadcast_world(&socket_clone, &clients, &world);
+                                            return;
+                                        }
+
+                                        if uname_map.contains_key(uname) {
                                             // name already taken and active
                                             let suggested = generate_unique_name(&world.players, uname);
                                             let resp = json!({"action": "name_conflict", "suggested": suggested});
@@ -117,14 +141,19 @@ fn main() -> std::io::Result<()> {
                                             return;
                                         }
 
-                                        let new_uuid = Uuid::new_v4();
+                                        // allocate uuid: prefer requested (unused) else new
+                                        let mut new_uuid = requested_uuid.unwrap_or_else(Uuid::new_v4);
+                                        while world.players.contains_key(&new_uuid) {
+                                            new_uuid = Uuid::new_v4();
+                                        }
                                         uname_map.insert(uname.to_string(), new_uuid);
                                         clients.insert(new_uuid, src);
                                         ls.insert(new_uuid, Instant::now());
 
                                         // create empty player entry
                                         let ps = PlayerState {
-                                            id: uname.to_string(),
+                                            uuid: new_uuid,
+                                            username: uname.to_string(),
                                             x: None,
                                             y: None,
                                             z: None,
@@ -137,17 +166,13 @@ fn main() -> std::io::Result<()> {
                                             vz: None,
                                             action: None,
                                         };
-                                        world.players.insert(uname.to_string(), ps);
+                                        world.players.insert(new_uuid, ps.clone());
 
-                                        let resp = json!({"action": "registered", "uuid": new_uuid.to_string()});
+                                        let resp = json!({"action": "registered", "uuid": new_uuid, "username": uname});
                                         let _ = socket_clone.send_to(resp.to_string().as_bytes(), src);
 
                                         // broadcast updated world
-                                        let state = json!({"players": world.players});
-                                        let s = state.to_string();
-                                        for addr in clients.values() {
-                                            let _ = socket_clone.send_to(s.as_bytes(), addr);
-                                        }
+                                        broadcast_world(&socket_clone, &clients, &world);
                                     }
                                 }
                                 "heartbeat" => {
@@ -162,103 +187,95 @@ fn main() -> std::io::Result<()> {
                                     // expect uuid and state fields
                                     if let Some(uuid_s) = val.get("uuid").and_then(|x| x.as_str()) {
                                         if let Ok(uuid) = Uuid::parse_str(uuid_s) {
-                                            let mut uname_map = username_map_clone.lock().unwrap();
-                                            if let Some(uname) = uname_map.iter().find(|(_, &u)| u == uuid).map(|(k,_)| k.clone()) {
-                                                let mut world = world_clone.lock().unwrap();
-                                                let mut clients = clients_clone.lock().unwrap();
-                                                let mut ls = last_seen_clone.lock().unwrap();
+                                            let mut world = world_clone.lock().unwrap();
+                                            let mut clients = clients_clone.lock().unwrap();
+                                            let mut ls = last_seen_clone.lock().unwrap();
 
+                                            if let Some(existing) = world.players.get(&uuid).cloned() {
                                                 // update last seen
                                                 ls.insert(uuid, Instant::now());
 
-                                                // build PlayerState from incoming fields
-                                                let mut p = PlayerState {
-                                                    id: uname.clone(),
-                                                    x: val.get("x").and_then(|x| x.as_f64()),
-                                                    y: val.get("y").and_then(|x| x.as_f64()),
-                                                    z: val.get("z").and_then(|x| x.as_f64()),
-                                                    ts: val.get("ts").and_then(|x| x.as_u64()).map(|v| v as u128),
-                                                    rx: val.get("rx").and_then(|x| x.as_f64()),
-                                                    ry: val.get("ry").and_then(|x| x.as_f64()),
-                                                    rz: val.get("rz").and_then(|x| x.as_f64()),
-                                                    vx: val.get("vx").and_then(|x| x.as_f64()),
-                                                    vy: val.get("vy").and_then(|x| x.as_f64()),
-                                                    vz: val.get("vz").and_then(|x| x.as_f64()),
-                                                    action: val.get("action").and_then(|x| x.as_str()).map(|s| s.to_string()),
-                                                };
+                                                // start from previous state and apply incoming fields
+                                                let mut updated = existing.clone();
+                                                updated.x = val.get("x").and_then(|x| x.as_f64());
+                                                updated.y = val.get("y").and_then(|x| x.as_f64());
+                                                updated.z = val.get("z").and_then(|x| x.as_f64());
+                                                updated.ts = val.get("ts").and_then(|x| x.as_u64()).map(|v| v as u128);
+                                                updated.rx = val.get("rx").and_then(|x| x.as_f64());
+                                                updated.ry = val.get("ry").and_then(|x| x.as_f64());
+                                                updated.rz = val.get("rz").and_then(|x| x.as_f64());
+                                                updated.vx = val.get("vx").and_then(|x| x.as_f64());
+                                                updated.vy = val.get("vy").and_then(|x| x.as_f64());
+                                                updated.vz = val.get("vz").and_then(|x| x.as_f64());
+                                                updated.action = val.get("action").and_then(|x| x.as_str()).map(|s| s.to_string());
 
-                                                // validate movement similar to before using username as key
+                                                // validate movement similar to before using previous state
                                                 let mut send_correction: Option<serde_json::Value> = None;
-                                                if let Some(prev) = world.players.get(&uname) {
-                                                    if let (Some(prev_x), Some(prev_y), Some(prev_z), Some(prev_ts), Some(new_ts)) = (
-                                                        prev.x,
-                                                        prev.y,
-                                                        prev.z,
-                                                        prev.ts,
-                                                        p.ts,
-                                                    ) {
-                                                        let dt_ms = if new_ts > prev_ts { new_ts - prev_ts } else { 0 };
-                                                        let dt = (dt_ms as f64) / 1000.0;
-                                                        if dt > 0.0 && dt < 60.0 {
-                                                            let svx = p.vx.unwrap_or(0.0);
-                                                            let svy = p.vy.unwrap_or(0.0);
-                                                            let svz = p.vz.unwrap_or(0.0);
-                                                            let expect_dx = svx * dt;
-                                                            let expect_dy = svy * dt;
-                                                            let expect_dz = svz * dt;
-                                                            let expect_dist = (expect_dx * expect_dx + expect_dy * expect_dy + expect_dz * expect_dz).sqrt();
+                                                if let (Some(prev_x), Some(prev_y), Some(prev_z), Some(prev_ts), Some(new_ts)) = (
+                                                    existing.x,
+                                                    existing.y,
+                                                    existing.z,
+                                                    existing.ts,
+                                                    updated.ts,
+                                                ) {
+                                                    let dt_ms = if new_ts > prev_ts { new_ts - prev_ts } else { 0 };
+                                                    let dt = (dt_ms as f64) / 1000.0;
+                                                    if dt > 0.0 && dt < 60.0 {
+                                                        let svx = updated.vx.unwrap_or(0.0);
+                                                        let svy = updated.vy.unwrap_or(0.0);
+                                                        let svz = updated.vz.unwrap_or(0.0);
+                                                        let expect_dx = svx * dt;
+                                                        let expect_dy = svy * dt;
+                                                        let expect_dz = svz * dt;
+                                                        let expect_dist = (expect_dx * expect_dx + expect_dy * expect_dy + expect_dz * expect_dz).sqrt();
 
-                                                            let dx = p.x.unwrap_or(prev_x) - prev_x;
-                                                            let dy = p.y.unwrap_or(prev_y) - prev_y;
-                                                            let dz = p.z.unwrap_or(prev_z) - prev_z;
-                                                            let actual_dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                                                        let dx = updated.x.unwrap_or(prev_x) - prev_x;
+                                                        let dy = updated.y.unwrap_or(prev_y) - prev_y;
+                                                        let dz = updated.z.unwrap_or(prev_z) - prev_z;
+                                                        let actual_dist = (dx * dx + dy * dy + dz * dz).sqrt();
 
-                                                            let tol = 0.5;
-                                                            if actual_dist > expect_dist + tol {
-                                                                let corrected_x = prev_x + expect_dx;
-                                                                let corrected_y = prev_y + expect_dy;
-                                                                let corrected_z = prev_z + expect_dz;
+                                                        let tol = 0.5;
+                                                        if actual_dist > expect_dist + tol {
+                                                            let corrected_x = prev_x + expect_dx;
+                                                            let corrected_y = prev_y + expect_dy;
+                                                            let corrected_z = prev_z + expect_dz;
 
-                                                                p.x = Some(corrected_x);
-                                                                p.y = Some(corrected_y);
-                                                                p.z = Some(corrected_z);
-                                                                p.ts = val.get("ts").and_then(|x| x.as_u64()).map(|v| v as u128);
+                                                            updated.x = Some(corrected_x);
+                                                            updated.y = Some(corrected_y);
+                                                            updated.z = Some(corrected_z);
+                                                            updated.ts = val.get("ts").and_then(|x| x.as_u64()).map(|v| v as u128);
 
-                                                                let corr = json!({
-                                                                    "action": "correction",
-                                                                    "reason": "invalid_movement",
-                                                                    "corrected": {
-                                                                        "username": uname.clone(),
-                                                                        "x": corrected_x,
-                                                                        "y": corrected_y,
-                                                                        "z": corrected_z,
-                                                                        "vx": svx,
-                                                                        "vy": svy,
-                                                                        "vz": svz,
-                                                                        "ts": new_ts
-                                                                    }
-                                                                });
-                                                                send_correction = Some(corr);
-                                                            }
+                                                            let corr = json!({
+                                                                "action": "correction",
+                                                                "reason": "invalid_movement",
+                                                                "corrected": {
+                                                                    "uuid": uuid,
+                                                                    "username": existing.username,
+                                                                    "x": corrected_x,
+                                                                    "y": corrected_y,
+                                                                    "z": corrected_z,
+                                                                    "vx": svx,
+                                                                    "vy": svy,
+                                                                    "vz": svz,
+                                                                    "ts": new_ts
+                                                                }
+                                                            });
+                                                            send_correction = Some(corr);
                                                         }
                                                     }
                                                 }
 
                                                 // store state and clients
-                                                world.players.insert(uname.clone(), p.clone());
+                                                world.players.insert(uuid, updated.clone());
                                                 clients.insert(uuid, src);
-                                                println!("Received update for {}", uname);
+                                                println!("Received update for {}", updated.username);
 
                                                 if let Some(c) = send_correction {
                                                     let _ = socket_clone.send_to(c.to_string().as_bytes(), src);
                                                 }
 
                                                 // broadcast world
-                                                let state = json!({"players": world.players});
-                                                let s = state.to_string();
-                                                for addr in clients.values() {
-                                                    let _ = socket_clone.send_to(s.as_bytes(), addr);
-                                                }
+                                                broadcast_world(&socket_clone, &clients, &world);
                                             }
                                         }
                                     }

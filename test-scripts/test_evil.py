@@ -8,12 +8,15 @@ SERVER_PORT = 8888
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+EXISTING_UUID = input("如果有历史 uuid，请输入（回车跳过）: ").strip()
 MY_NAME = input("请输入用户名 (evil 客户端): ").strip()
 if MY_NAME == "":
     MY_NAME = "Evil_" + str(random.randint(1, 1000))
 
 sock.settimeout(2.0)
 reg = {"type": "register", "username": MY_NAME}
+if EXISTING_UUID:
+    reg["uuid"] = EXISTING_UUID
 sock.sendto(json.dumps(reg).encode('utf-8'), (SERVER_IP, SERVER_PORT))
 try:
     resp, _ = sock.recvfrom(4096)
@@ -68,7 +71,7 @@ try:
             fake_y = y + random.uniform(10.0, 50.0)
             fake_z = z + random.uniform(10.0, 50.0)
             send = {
-                "id": MY_ID,
+                "username": MY_NAME,
                 "x": fake_x,
                 "y": fake_y,
                 "z": fake_z,
@@ -84,7 +87,7 @@ try:
         else:
             # send honest update
             send = {
-                "id": MY_ID,
+                "username": MY_NAME,
                 "x": x,
                 "y": y,
                 "z": z,
@@ -110,7 +113,7 @@ try:
             obj = json.loads(resp.decode('utf-8'))
             if isinstance(obj, dict) and obj.get('action') == 'correction':
                 corr = obj.get('corrected')
-                if isinstance(corr, dict) and corr.get('id') == MY_ID:
+                if isinstance(corr, dict) and corr.get('uuid') == UUID:
                     # apply correction to local true state
                     x = float(corr.get('x', x))
                     y = float(corr.get('y', y))
@@ -123,8 +126,8 @@ try:
                 # could be world state broadcast; print short summary
                 if isinstance(obj, dict) and 'players' in obj:
                     players = obj.get('players', {})
-                    if MY_ID in players:
-                        p = players[MY_ID]
+                    if UUID in players:
+                        p = players[UUID]
                         print(f"[WORLD] server_pos=({p.get('x')},{p.get('y')},{p.get('z')})")
         except socket.timeout:
             pass
@@ -142,3 +145,5 @@ try:
         time.sleep(0.5)
 except KeyboardInterrupt:
     print("退出 evil client")
+finally:
+    print(f"evil client 退出，uuid={UUID}")
