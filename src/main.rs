@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use rust_server::{PlayerState, WorldState, UuidStorage, generate_unique_name};
+use backend_demo::{PlayerState, WorldState, UuidStorage, generate_unique_name};
 
 // `PlayerState`, `WorldState` and `generate_unique_name` are defined
 // in `src/lib.rs` and re-used by this binary.

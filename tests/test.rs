@@ -1,4 +1,4 @@
-use rust_server::{generate_unique_name, validate_movement, PlayerState, WorldState, UuidStorage};
+use backend_demo::{generate_unique_name, validate_movement, PlayerState, WorldState, UuidStorage};
 use std::collections::HashMap;
 use uuid::Uuid;
 use std::fs;
