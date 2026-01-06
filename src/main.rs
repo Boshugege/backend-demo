@@ -6,13 +6,20 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use rust_server::{PlayerState, WorldState, generate_unique_name};
+use rust_server::{PlayerState, WorldState, UuidStorage, generate_unique_name};
 
 // `PlayerState`, `WorldState` and `generate_unique_name` are defined
 // in `src/lib.rs` and re-used by this binary.
 
-fn broadcast_world(socket: &UdpSocket, clients: &HashMap<Uuid, SocketAddr>, world: &WorldState) {
-    let payload = json!({"players": world.players}).to_string();
+fn broadcast_world(socket: &UdpSocket, clients: &HashMap<Uuid, SocketAddr>, world: &WorldState, online_status: &HashMap<Uuid, bool>) {
+    // 只广播在线玩家
+    let online_players: HashMap<Uuid, PlayerState> = world.players
+        .iter()
+        .filter(|(uuid, _)| online_status.get(uuid).copied().unwrap_or(false))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    
+    let payload = json!({"players": online_players}).to_string();
     for addr in clients.values() {
         let _ = socket.send_to(payload.as_bytes(), addr);
     }
@@ -28,52 +35,71 @@ fn main() -> std::io::Result<()> {
     let clients: Arc<Mutex<HashMap<Uuid, SocketAddr>>> = Arc::new(Mutex::new(HashMap::new()));
     // username -> uuid
     let username_map: Arc<Mutex<HashMap<String, Uuid>>> = Arc::new(Mutex::new(HashMap::new()));
-    // track last seen time per uuid for heartbeat timeout
+    // track last seen time per uuid for inactivity timeout
     let last_seen: Arc<Mutex<HashMap<Uuid, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+    // online status: uuid -> bool (true=online, false=offline)
+    let online_status: Arc<Mutex<HashMap<Uuid, bool>>> = Arc::new(Mutex::new(HashMap::new()));
+    // UUID persistence storage
+    let uuid_storage: Arc<Mutex<UuidStorage>> = Arc::new(Mutex::new(
+        UuidStorage::load_from_file("uuid_storage.json").unwrap_or_else(|_| UuidStorage {
+            uuids: HashMap::new(),
+        })
+    ));
 
-    // background cleanup: remove players not seen for 3 minutes (180s)
+    // background cleanup: mark players offline if not seen for 60 seconds
     {
         let world_bg = world.clone();
         let clients_bg = clients.clone();
         let last_seen_bg = last_seen.clone();
-        let username_map_bg = username_map.clone();
+        let online_status_bg = online_status.clone();
+        let uuid_storage_bg = uuid_storage.clone();
         let socket_bg = socket.try_clone()?;
         thread::spawn(move || loop {
             thread::sleep(Duration::from_secs(5));
             let now = Instant::now();
-            let mut to_remove: Vec<Uuid> = Vec::new();
+            let mut to_offline: Vec<Uuid> = Vec::new();
 
             {
                 let ls = last_seen_bg.lock().unwrap();
                 for (id, &t) in ls.iter() {
-                    if now.duration_since(t) > Duration::from_secs(180) {
-                        to_remove.push(*id);
+                    if now.duration_since(t) > Duration::from_secs(60) {
+                        to_offline.push(*id);
                     }
                 }
             }
 
-            if !to_remove.is_empty() {
-                let mut world = world_bg.lock().unwrap();
-                let mut clients = clients_bg.lock().unwrap();
-                let mut ls = last_seen_bg.lock().unwrap();
-                let mut uname_map = username_map_bg.lock().unwrap();
+            if !to_offline.is_empty() {
+                let world = world_bg.lock().unwrap();
+                let clients = clients_bg.lock().unwrap();
+                let mut online = online_status_bg.lock().unwrap();
+                let mut storage = uuid_storage_bg.lock().unwrap();
 
-                for uuid in to_remove.iter() {
-                    if let Some(addr) = clients.remove(uuid) {
-                        // notify removed client
-                        let notif = json!({"action": "removed", "reason": "timeout"});
-                        let _ = socket_bg.send_to(notif.to_string().as_bytes(), addr);
+                for uuid in to_offline.iter() {
+                    if let Some(player) = world.players.get(uuid) {
+                        // Mark as offline
+                        online.insert(*uuid, false);
+                        
+                        // Persist UUID to storage
+                        storage.add_uuid(*uuid, player.username.clone());
+                        let _ = storage.save_to_file("uuid_storage.json");
+                        
+                        // Notify the player
+                        if let Some(addr) = clients.get(uuid) {
+                            let notif = json!({
+                                "action": "offline",
+                                "reason": "inactivity",
+                                "uuid": uuid,
+                                "message": "No activity for 60 seconds, going offline. Rejoin with same UUID to resume."
+                            });
+                            let _ = socket_bg.send_to(notif.to_string().as_bytes(), addr);
+                        }
+                        
+                        println!("Marked {} as offline (UUID saved)", player.username);
                     }
-                    // remove username mapping and world entry
-                    if let Some(player) = world.players.remove(uuid) {
-                        uname_map.remove(&player.username);
-                        println!("Removed {} due to timeout", player.username);
-                    }
-                    ls.remove(uuid);
                 }
 
-                // broadcast updated world after removals
-                broadcast_world(&socket_bg, &clients, &world);
+                // broadcast updated world (only online players)
+                broadcast_world(&socket_bg, &clients, &world, &online);
             }
         });
     }
@@ -97,11 +123,13 @@ fn main() -> std::io::Result<()> {
                     let world_clone = world.clone();
                     let clients_clone = clients.clone();
                     let last_seen_clone = last_seen.clone();
+                    let online_status_clone = online_status.clone();
                     let username_map_clone = username_map.clone();
+                    let uuid_storage_clone = uuid_storage.clone();
                     let socket_clone = socket.try_clone().expect("failed clone");
 
                     thread::spawn(move || {
-                        // handle message types: register, heartbeat, update
+                        // handle message types: register, update
                         if let Some(t) = val.get("type").and_then(|x| x.as_str()) {
                             match t {
                                 "register" => {
@@ -113,42 +141,91 @@ fn main() -> std::io::Result<()> {
                                         let mut uname_map = username_map_clone.lock().unwrap();
                                         let mut clients = clients_clone.lock().unwrap();
                                         let mut ls = last_seen_clone.lock().unwrap();
+                                        let mut online = online_status_clone.lock().unwrap();
                                         let mut world = world_clone.lock().unwrap();
+                                        let mut storage = uuid_storage_clone.lock().unwrap();
 
-                                        // resume if provided uuid exists server-side
-                                        if let Some(existing_uuid) = requested_uuid.and_then(|id| world.players.get(&id).map(|_| id)) {
-                                            let player = world.players.get(&existing_uuid).cloned().unwrap();
-                                            uname_map.insert(player.username.clone(), existing_uuid);
-                                            clients.insert(existing_uuid, src);
-                                            ls.insert(existing_uuid, Instant::now());
+                                        // Try to resume if provided uuid exists
+                                        if let Some(existing_uuid) = requested_uuid {
+                                            if world.players.contains_key(&existing_uuid) {
+                                                // UUID exists in memory - resume
+                                                let player = world.players.get(&existing_uuid).cloned().unwrap();
+                                                uname_map.insert(player.username.clone(), existing_uuid);
+                                                clients.insert(existing_uuid, src);
+                                                ls.insert(existing_uuid, Instant::now());
+                                                online.insert(existing_uuid, true);
 
-                                            let resp = json!({
-                                                "action": "registered",
-                                                "uuid": existing_uuid,
-                                                "username": player.username,
-                                                "state": player,
-                                            });
-                                            let _ = socket_clone.send_to(resp.to_string().as_bytes(), src);
-                                            broadcast_world(&socket_clone, &clients, &world);
-                                            return;
+                                                let resp = json!({
+                                                    "action": "registered",
+                                                    "uuid": existing_uuid,
+                                                    "username": player.username,
+                                                    "state": player,
+                                                    "resumed": true
+                                                });
+                                                let _ = socket_clone.send_to(resp.to_string().as_bytes(), src);
+                                                broadcast_world(&socket_clone, &clients, &world, &online);
+                                                return;
+                                            } else if storage.contains_uuid(&existing_uuid) {
+                                                // UUID exists in persistent storage - restore
+                                                let stored_username = storage.get_username(&existing_uuid).unwrap();
+                                                
+                                                // Create restored player state
+                                                let restored_player = PlayerState {
+                                                    uuid: existing_uuid,
+                                                    username: stored_username.clone(),
+                                                    x: None,
+                                                    y: None,
+                                                    z: None,
+                                                    ts: None,
+                                                    rx: None,
+                                                    ry: None,
+                                                    rz: None,
+                                                    vx: None,
+                                                    vy: None,
+                                                    vz: None,
+                                                    action: None,
+                                                };
+                                                
+                                                world.players.insert(existing_uuid, restored_player.clone());
+                                                uname_map.insert(stored_username.clone(), existing_uuid);
+                                                clients.insert(existing_uuid, src);
+                                                ls.insert(existing_uuid, Instant::now());
+                                                online.insert(existing_uuid, true);
+
+                                                let resp = json!({
+                                                    "action": "registered",
+                                                    "uuid": existing_uuid,
+                                                    "username": stored_username,
+                                                    "state": restored_player,
+                                                    "resumed": true,
+                                                    "from_storage": true
+                                                });
+                                                let _ = socket_clone.send_to(resp.to_string().as_bytes(), src);
+                                                broadcast_world(&socket_clone, &clients, &world, &online);
+                                                return;
+                                            }
                                         }
 
+                                        // Check for active username conflict (online players only)
                                         if uname_map.contains_key(uname) {
-                                            // name already taken and active
                                             let suggested = generate_unique_name(&world.players, uname);
                                             let resp = json!({"action": "name_conflict", "suggested": suggested});
                                             let _ = socket_clone.send_to(resp.to_string().as_bytes(), src);
                                             return;
                                         }
 
-                                        // allocate uuid: prefer requested (unused) else new
+                                        // allocate new uuid
                                         let mut new_uuid = requested_uuid.unwrap_or_else(Uuid::new_v4);
                                         while world.players.contains_key(&new_uuid) {
                                             new_uuid = Uuid::new_v4();
                                         }
+                                        
                                         uname_map.insert(uname.to_string(), new_uuid);
                                         clients.insert(new_uuid, src);
                                         ls.insert(new_uuid, Instant::now());
+                                        online.insert(new_uuid, true);
+                                        storage.add_uuid(new_uuid, uname.to_string());
+                                        let _ = storage.save_to_file("uuid_storage.json");
 
                                         // create empty player entry
                                         let ps = PlayerState {
@@ -172,15 +249,7 @@ fn main() -> std::io::Result<()> {
                                         let _ = socket_clone.send_to(resp.to_string().as_bytes(), src);
 
                                         // broadcast updated world
-                                        broadcast_world(&socket_clone, &clients, &world);
-                                    }
-                                }
-                                "heartbeat" => {
-                                    if let Some(uuid_s) = val.get("uuid").and_then(|x| x.as_str()) {
-                                        if let Ok(uuid) = Uuid::parse_str(uuid_s) {
-                                            let mut ls = last_seen_clone.lock().unwrap();
-                                            ls.insert(uuid, Instant::now());
-                                        }
+                                        broadcast_world(&socket_clone, &clients, &world, &online);
                                     }
                                 }
                                 "update" => {
@@ -190,10 +259,12 @@ fn main() -> std::io::Result<()> {
                                             let mut world = world_clone.lock().unwrap();
                                             let mut clients = clients_clone.lock().unwrap();
                                             let mut ls = last_seen_clone.lock().unwrap();
+                                            let mut online = online_status_clone.lock().unwrap();
 
                                             if let Some(existing) = world.players.get(&uuid).cloned() {
-                                                // update last seen
+                                                // update last seen and mark as online
                                                 ls.insert(uuid, Instant::now());
+                                                online.insert(uuid, true);
 
                                                 // start from previous state and apply incoming fields
                                                 let mut updated = existing.clone();
@@ -274,8 +345,8 @@ fn main() -> std::io::Result<()> {
                                                     let _ = socket_clone.send_to(c.to_string().as_bytes(), src);
                                                 }
 
-                                                // broadcast world
-                                                broadcast_world(&socket_clone, &clients, &world);
+                                                // broadcast world (only online players)
+                                                broadcast_world(&socket_clone, &clients, &world, &online);
                                             }
                                         }
                                     }

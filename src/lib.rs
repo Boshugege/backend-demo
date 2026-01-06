@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -27,6 +29,54 @@ pub struct PlayerState {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WorldState {
     pub players: HashMap<Uuid, PlayerState>,
+}
+
+/// UUID 持久化存储结构
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UuidStorage {
+    /// 记录所有见过的 UUID 及其对应的用户名
+    pub uuids: HashMap<Uuid, String>,
+}
+
+impl UuidStorage {
+    /// 从文件加载 UUID 存储
+    pub fn load_from_file(path: &str) -> std::io::Result<Self> {
+        if Path::new(path).exists() {
+            let content = fs::read_to_string(path)?;
+            match serde_json::from_str(&content) {
+                Ok(storage) => Ok(storage),
+                Err(_) => Ok(UuidStorage {
+                    uuids: HashMap::new(),
+                }),
+            }
+        } else {
+            Ok(UuidStorage {
+                uuids: HashMap::new(),
+            })
+        }
+    }
+
+    /// 保存 UUID 存储到文件
+    pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
+        let json = serde_json::to_string_pretty(&self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        fs::write(path, json)
+    }
+
+    /// 添加或更新 UUID
+    pub fn add_uuid(&mut self, uuid: Uuid, username: String) {
+        self.uuids.insert(uuid, username);
+    }
+
+    /// 检查 UUID 是否存在
+    pub fn contains_uuid(&self, uuid: &Uuid) -> bool {
+        self.uuids.contains_key(uuid)
+    }
+
+    /// 获取 UUID 对应的用户名
+    pub fn get_username(&self, uuid: &Uuid) -> Option<String> {
+        self.uuids.get(uuid).cloned()
+    }
 }
 
 /// 生成唯一的用户名（当请求的名字已被占用时）

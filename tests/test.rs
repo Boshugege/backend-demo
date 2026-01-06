@@ -1,6 +1,7 @@
-use rust_server::{generate_unique_name, validate_movement, PlayerState, WorldState};
+use rust_server::{generate_unique_name, validate_movement, PlayerState, WorldState, UuidStorage};
 use std::collections::HashMap;
 use uuid::Uuid;
+use std::fs;
 
 fn empty_player(username: &str) -> PlayerState {
     PlayerState {
@@ -521,5 +522,126 @@ fn test_movement_validation_boundary_just_under_limit() {
         10.0, 0.0, 0.0,     // 实际速度无法达到这个移动
     );
     assert!(!result.is_valid); // 应该进行验证并检测到作弊
+}
+
+// ============================================================================
+// UUID 持久化存储测试
+// ============================================================================
+
+#[test]
+fn test_uuid_storage_add_and_retrieve() {
+    let mut storage = UuidStorage {
+        uuids: HashMap::new(),
+    };
+    let uuid = Uuid::new_v4();
+    storage.add_uuid(uuid, "player_test".to_string());
+    
+    assert!(storage.contains_uuid(&uuid));
+    assert_eq!(storage.get_username(&uuid), Some("player_test".to_string()));
+}
+
+#[test]
+fn test_uuid_storage_multiple_entries() {
+    let mut storage = UuidStorage {
+        uuids: HashMap::new(),
+    };
+    let uuid1 = Uuid::new_v4();
+    let uuid2 = Uuid::new_v4();
+    
+    storage.add_uuid(uuid1, "player_1".to_string());
+    storage.add_uuid(uuid2, "player_2".to_string());
+    
+    assert_eq!(storage.get_username(&uuid1), Some("player_1".to_string()));
+    assert_eq!(storage.get_username(&uuid2), Some("player_2".to_string()));
+}
+
+#[test]
+fn test_uuid_storage_file_persistence() {
+    let test_file = "test_uuid_storage.json";
+    
+    // 创建和保存存储
+    {
+        let mut storage = UuidStorage {
+            uuids: HashMap::new(),
+        };
+        let uuid = Uuid::new_v4();
+        storage.add_uuid(uuid, "offline_player".to_string());
+        storage.save_to_file(test_file).expect("Failed to save");
+    }
+    
+    // 从文件加载
+    let loaded = UuidStorage::load_from_file(test_file).expect("Failed to load");
+    
+    // 验证数据完整性
+    assert_eq!(loaded.uuids.len(), 1);
+    
+    // 清理测试文件
+    let _ = fs::remove_file(test_file);
+}
+
+#[test]
+fn test_uuid_storage_load_nonexistent_file() {
+    // 加载不存在的文件应该返回空存储
+    let storage = UuidStorage::load_from_file("nonexistent_file_xyz.json")
+        .expect("Should create empty storage");
+    assert_eq!(storage.uuids.len(), 0);
+}
+
+#[test]
+fn test_uuid_storage_update_existing() {
+    let mut storage = UuidStorage {
+        uuids: HashMap::new(),
+    };
+    let uuid = Uuid::new_v4();
+    
+    storage.add_uuid(uuid, "original_name".to_string());
+    // 覆盖相同 UUID 的用户名
+    storage.add_uuid(uuid, "updated_name".to_string());
+    
+    assert_eq!(storage.get_username(&uuid), Some("updated_name".to_string()));
+}
+
+// ============================================================================
+// 离线状态测试（仅验证数据结构，实际离线通知逻辑在 main.rs）
+// ============================================================================
+
+#[test]
+fn test_online_status_tracking() {
+    let mut online_status: HashMap<Uuid, bool> = HashMap::new();
+    let uuid = Uuid::new_v4();
+    
+    // 玩家上线
+    online_status.insert(uuid, true);
+    assert_eq!(online_status.get(&uuid).copied(), Some(true));
+    
+    // 玩家离线
+    online_status.insert(uuid, false);
+    assert_eq!(online_status.get(&uuid).copied(), Some(false));
+}
+
+#[test]
+fn test_broadcast_filters_offline_players() {
+    let mut world: HashMap<Uuid, PlayerState> = HashMap::new();
+    let mut online_status: HashMap<Uuid, bool> = HashMap::new();
+    
+    let uuid_online = Uuid::new_v4();
+    let uuid_offline = Uuid::new_v4();
+    
+    world.insert(uuid_online, empty_player("online_player"));
+    world.insert(uuid_offline, empty_player("offline_player"));
+    
+    online_status.insert(uuid_online, true);
+    online_status.insert(uuid_offline, false);
+    
+    // 过滤在线玩家（模拟 broadcast_world 的行为）
+    let online_players: Vec<Uuid> = world
+        .keys()
+        .filter(|uuid| online_status.get(uuid).copied().unwrap_or(false))
+        .cloned()
+        .collect();
+    
+    assert_eq!(online_players.len(), 1);
+    assert!(online_players.contains(&uuid_online));
+    assert!(!online_players.contains(&uuid_offline));
 }
 
