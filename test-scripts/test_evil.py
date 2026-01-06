@@ -5,11 +5,39 @@ import random
 
 SERVER_IP = "127.0.0.1"
 SERVER_PORT = 8888
-MY_ID = "Evil_" + str(random.randint(1, 100))
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-print(f"我是 {MY_ID}, 启动恶意测试客户端（会在随机时刻发送不合规位置）")
+MY_NAME = input("请输入用户名 (evil 客户端): ").strip()
+if MY_NAME == "":
+    MY_NAME = "Evil_" + str(random.randint(1, 1000))
+
+sock.settimeout(2.0)
+reg = {"type": "register", "username": MY_NAME}
+sock.sendto(json.dumps(reg).encode('utf-8'), (SERVER_IP, SERVER_PORT))
+try:
+    resp, _ = sock.recvfrom(4096)
+    r = json.loads(resp.decode('utf-8'))
+    if isinstance(r, dict) and r.get('action') == 'name_conflict':
+        suggested = r.get('suggested')
+        print(f"服务器建议更名为 {suggested}")
+        MY_NAME = suggested
+        reg = {"type": "register", "username": MY_NAME}
+        sock.sendto(json.dumps(reg).encode('utf-8'), (SERVER_IP, SERVER_PORT))
+        resp, _ = sock.recvfrom(4096)
+        r = json.loads(resp.decode('utf-8'))
+
+    if isinstance(r, dict) and r.get('action') == 'registered':
+        UUID = r.get('uuid')
+        print(f"已注册，uuid={UUID}")
+    else:
+        print("注册失败，继续使用临时用户名")
+        UUID = None
+except socket.timeout:
+    print("注册无响应，继续使用临时用户名")
+    UUID = None
+
+print(f"我是 {MY_NAME}, 启动恶意测试客户端（会在随机时刻发送不合规位置）")
 
 # local true state (the client believes these are real)
 x, y, z = 0.0, 0.0, 0.0
@@ -17,6 +45,7 @@ rx, ry, rz = 0.0, 0.0, 0.0
 vx, vy, vz = 0.2, 0.0, 0.0
 
 try:
+    last_heartbeat = time.time()
     while True:
         # integrate true state
         x += vx * 0.5
@@ -69,7 +98,10 @@ try:
             }
             print(f"[SEND OK] pos=({x:.2f},{y:.2f},{z:.2f}) ts={ts}")
 
-        sock.sendto(json.dumps(send).encode('utf-8'), (SERVER_IP, SERVER_PORT))
+        # wrap into update message including uuid
+        payload = {"type": "update", "uuid": UUID}
+        payload.update(send)
+        sock.sendto(json.dumps(payload).encode('utf-8'), (SERVER_IP, SERVER_PORT))
 
         # wait briefly and check for server messages
         sock.settimeout(0.25)
@@ -96,6 +128,16 @@ try:
                         print(f"[WORLD] server_pos=({p.get('x')},{p.get('y')},{p.get('z')})")
         except socket.timeout:
             pass
+
+        # heartbeat every 30s
+        now = time.time()
+        if UUID and now - last_heartbeat > 30:
+            hb = {"type": "heartbeat", "uuid": UUID}
+            try:
+                sock.sendto(json.dumps(hb).encode('utf-8'), (SERVER_IP, SERVER_PORT))
+            except Exception:
+                pass
+            last_heartbeat = now
 
         time.sleep(0.5)
 except KeyboardInterrupt:

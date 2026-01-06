@@ -5,13 +5,46 @@ import random
 import sys
 
 # 配置
+# server
 SERVER_IP = "127.0.0.1"
 SERVER_PORT = 8888
-MY_ID = "Player_" + str(random.randint(1, 100))
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-print(f"我是 {MY_ID}, 开始发送三维位移/旋转/速度数据...")
+# ask user for a custom username before registering
+MY_NAME = input("请输入用户名: ").strip()
+if MY_NAME == "":
+    MY_NAME = "player_" + str(random.randint(1, 1000))
+
+print(f"尝试注册用户名: {MY_NAME}")
+
+# register and obtain uuid
+sock.settimeout(2.0)
+reg = {"type": "register", "username": MY_NAME}
+sock.sendto(json.dumps(reg).encode('utf-8'), (SERVER_IP, SERVER_PORT))
+try:
+    resp, _ = sock.recvfrom(4096)
+    r = json.loads(resp.decode('utf-8'))
+    if isinstance(r, dict) and r.get('action') == 'name_conflict':
+        suggested = r.get('suggested')
+        print(f"服务器建议更名为 {suggested}")
+        MY_NAME = input(f"请输入新用户名（回车接收建议 {suggested}）: ").strip() or suggested
+        reg = {"type": "register", "username": MY_NAME}
+        sock.sendto(json.dumps(reg).encode('utf-8'), (SERVER_IP, SERVER_PORT))
+        resp, _ = sock.recvfrom(4096)
+        r = json.loads(resp.decode('utf-8'))
+
+    if isinstance(r, dict) and r.get('action') == 'registered':
+        UUID = r.get('uuid')
+        print(f"已注册，uuid={UUID}")
+    else:
+        print("注册失败，继续使用临时用户名")
+        UUID = None
+except socket.timeout:
+    print("注册无响应，继续使用临时用户名")
+    UUID = None
+
+print(f"我是 {MY_NAME}, 开始发送三维位移/旋转/速度数据...")
 # 本地维护最近一次世界状态
 latest_world = {"players": {}}
 
@@ -23,6 +56,7 @@ try:
     # velocities
     vx, vy, vz = 0.1, 0.0, 0.0
 
+    last_heartbeat = time.time()
     while True:
         # 简单物理积分：位置 += 速度
         x += vx
@@ -39,8 +73,9 @@ try:
             rz += random.uniform(-1.0, 1.0)
 
         ts = int(time.time() * 1000)
-        data = {
-            "id": MY_ID,
+        payload = {
+            "type": "update",
+            "uuid": UUID,
             "x": x,
             "y": y,
             "z": z,
@@ -53,8 +88,7 @@ try:
             "ts": ts,
         }
 
-        msg = json.dumps(data).encode('utf-8')
-        sock.sendto(msg, (SERVER_IP, SERVER_PORT))
+        sock.sendto(json.dumps(payload).encode('utf-8'), (SERVER_IP, SERVER_PORT))
 
         # 接收服务器回传的世界状态或控制消息
         sock.settimeout(0.1)
@@ -91,6 +125,16 @@ try:
                 print("收到未知消息:", payload)
         except socket.timeout:
             pass
+
+        # heartbeat every 30s
+        now = time.time()
+        if UUID and now - last_heartbeat > 30:
+            hb = {"type": "heartbeat", "uuid": UUID}
+            try:
+                sock.sendto(json.dumps(hb).encode('utf-8'), (SERVER_IP, SERVER_PORT))
+            except Exception:
+                pass
+            last_heartbeat = now
 
         time.sleep(0.05)
 except KeyboardInterrupt:
