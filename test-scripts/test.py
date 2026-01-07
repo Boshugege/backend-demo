@@ -26,12 +26,17 @@ sock.settimeout(2.0)
 # try to resume with existing uuid if provided
 if EXISTING_UUID:
     print(f"尝试恢复 uuid: {EXISTING_UUID}")
-    reg = {"type": "register", "username": "resume", "uuid": EXISTING_UUID}
+    # 只发送 UUID，不发送用户名（表示尝试恢复）
+    reg = {"type": "register", "uuid": EXISTING_UUID}
     sock.sendto(json.dumps(reg).encode('utf-8'), (SERVER_IP, SERVER_PORT))
     try:
         resp, _ = sock.recvfrom(4096)
         r = json.loads(resp.decode('utf-8'))
-        if isinstance(r, dict) and r.get('action') == 'registered':
+        if isinstance(r, dict) and r.get('action') == 'uuid_not_found':
+            print(f"错误: {r.get('message')}")
+            print("UUID 不存在，需要创建新账号")
+            UUID = None
+        elif isinstance(r, dict) and r.get('action') == 'registered':
             UUID = r.get('uuid')
             MY_NAME = r.get('username')
             # resume prior state if provided

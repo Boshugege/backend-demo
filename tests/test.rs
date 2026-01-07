@@ -1,7 +1,10 @@
-use backend_demo::{generate_unique_name, validate_movement, PlayerState, WorldState, UuidStorage};
+use backend_demo::{generate_unique_name, validate_movement, PlayerState, WorldState};
 use std::collections::HashMap;
 use uuid::Uuid;
 use std::fs;
+use std::net::UdpSocket;
+use std::time::{Duration, Instant};
+use serde_json::{json, Value};
 
 fn empty_player(username: &str) -> PlayerState {
     PlayerState {
@@ -435,39 +438,6 @@ fn test_world_state_multiple_players() {
     assert!(world.players.contains_key(&uuid2));
 }
 
-#[test]
-fn test_world_state_serialization() {
-    let mut world = WorldState {
-        players: HashMap::new(),
-    };
-
-    let uuid = Uuid::new_v4();
-    world.players.insert(
-        uuid,
-        PlayerState {
-            uuid,
-            username: "test".to_string(),
-            x: Some(1.0),
-            y: Some(2.0),
-            z: Some(3.0),
-            ts: Some(1000),
-            rx: None,
-            ry: None,
-            rz: None,
-            vx: None,
-            vy: None,
-            vz: None,
-            action: None,
-        },
-    );
-
-    let json = serde_json::to_string(&world).unwrap();
-    let deserialized: WorldState = serde_json::from_str(&json).unwrap();
-
-    assert_eq!(deserialized.players.len(), 1);
-    assert!(deserialized.players.contains_key(&uuid));
-}
-
 // ============================================================================
 // 边界情况和极限值测试
 // ============================================================================
@@ -525,123 +495,383 @@ fn test_movement_validation_boundary_just_under_limit() {
 }
 
 // ============================================================================
-// UUID 持久化存储测试
+// 世界状态持久化测试（新优化逻辑）
 // ============================================================================
 
 #[test]
-fn test_uuid_storage_add_and_retrieve() {
-    let mut storage = UuidStorage {
-        uuids: HashMap::new(),
+fn test_world_state_serialization() {
+    let mut world = WorldState {
+        players: HashMap::new(),
     };
-    let uuid = Uuid::new_v4();
-    storage.add_uuid(uuid, "player_test".to_string());
     
-    assert!(storage.contains_uuid(&uuid));
-    assert_eq!(storage.get_username(&uuid), Some("player_test".to_string()));
-}
-
-#[test]
-fn test_uuid_storage_multiple_entries() {
-    let mut storage = UuidStorage {
-        uuids: HashMap::new(),
-    };
     let uuid1 = Uuid::new_v4();
     let uuid2 = Uuid::new_v4();
     
-    storage.add_uuid(uuid1, "player_1".to_string());
-    storage.add_uuid(uuid2, "player_2".to_string());
+    world.players.insert(uuid1, empty_player("player_1"));
+    world.players.insert(uuid2, empty_player("player_2"));
     
-    assert_eq!(storage.get_username(&uuid1), Some("player_1".to_string()));
-    assert_eq!(storage.get_username(&uuid2), Some("player_2".to_string()));
+    // 序列化
+    let json = serde_json::to_string(&world).expect("Failed to serialize");
+    
+    // 反序列化
+    let loaded: WorldState = serde_json::from_str(&json).expect("Failed to deserialize");
+    
+    assert_eq!(loaded.players.len(), 2);
+    assert!(loaded.players.contains_key(&uuid1));
+    assert!(loaded.players.contains_key(&uuid2));
 }
 
 #[test]
-fn test_uuid_storage_file_persistence() {
-    let test_file = "test_uuid_storage.json";
+fn test_world_state_file_persistence() {
+    let test_file = "test_world_state.json";
     
-    // 创建和保存存储
-    {
-        let mut storage = UuidStorage {
-            uuids: HashMap::new(),
-        };
-        let uuid = Uuid::new_v4();
-        storage.add_uuid(uuid, "offline_player".to_string());
-        storage.save_to_file(test_file).expect("Failed to save");
-    }
+    // 创建世界状态
+    let mut world = WorldState {
+        players: HashMap::new(),
+    };
+    let uuid = Uuid::new_v4();
+    world.players.insert(uuid, empty_player("persistent_player"));
+    
+    // 保存到文件
+    let json = serde_json::to_string_pretty(&world).expect("Failed to serialize");
+    fs::write(test_file, json).expect("Failed to write file");
     
     // 从文件加载
-    let loaded = UuidStorage::load_from_file(test_file).expect("Failed to load");
+    let content = fs::read_to_string(test_file).expect("Failed to read file");
+    let loaded: WorldState = serde_json::from_str(&content).expect("Failed to deserialize");
     
-    // 验证数据完整性
-    assert_eq!(loaded.uuids.len(), 1);
+    // 验证
+    assert_eq!(loaded.players.len(), 1);
+    assert_eq!(loaded.players.get(&uuid).unwrap().username, "persistent_player");
     
-    // 清理测试文件
+    // 清理
     let _ = fs::remove_file(test_file);
 }
 
-#[test]
-fn test_uuid_storage_load_nonexistent_file() {
-    // 加载不存在的文件应该返回空存储
-    let storage = UuidStorage::load_from_file("nonexistent_file_xyz.json")
-        .expect("Should create empty storage");
-    assert_eq!(storage.uuids.len(), 0);
-}
-
-#[test]
-fn test_uuid_storage_update_existing() {
-    let mut storage = UuidStorage {
-        uuids: HashMap::new(),
-    };
-    let uuid = Uuid::new_v4();
-    
-    storage.add_uuid(uuid, "original_name".to_string());
-    // 覆盖相同 UUID 的用户名
-    storage.add_uuid(uuid, "updated_name".to_string());
-    
-    assert_eq!(storage.get_username(&uuid), Some("updated_name".to_string()));
-}
-
 // ============================================================================
-// 离线状态测试（仅验证数据结构，实际离线通知逻辑在 main.rs）
+// 在线状态判断测试（基于 last_seen）
 // ============================================================================
 
 #[test]
-fn test_online_status_tracking() {
-    let mut online_status: HashMap<Uuid, bool> = HashMap::new();
-    let uuid = Uuid::new_v4();
-    
-    // 玩家上线
-    online_status.insert(uuid, true);
-    assert_eq!(online_status.get(&uuid).copied(), Some(true));
-    
-    // 玩家离线
-    online_status.insert(uuid, false);
-    assert_eq!(online_status.get(&uuid).copied(), Some(false));
-}
-
-#[test]
-fn test_broadcast_filters_offline_players() {
-    let mut world: HashMap<Uuid, PlayerState> = HashMap::new();
-    let mut online_status: HashMap<Uuid, bool> = HashMap::new();
-    
+fn test_online_detection_by_last_seen() {
+    let mut last_seen: HashMap<Uuid, Instant> = HashMap::new();
     let uuid_online = Uuid::new_v4();
     let uuid_offline = Uuid::new_v4();
     
+    let now = Instant::now();
+    
+    // 在线玩家：刚刚活跃
+    last_seen.insert(uuid_online, now);
+    
+    // 离线玩家：60秒前活跃
+    last_seen.insert(uuid_offline, now - Duration::from_secs(61));
+    
+    // 判断在线状态
+    let is_online = |uuid: &Uuid| {
+        last_seen.get(uuid)
+            .map(|&t| now.duration_since(t).as_secs() < 60)
+            .unwrap_or(false)
+    };
+    
+    assert!(is_online(&uuid_online));
+    assert!(!is_online(&uuid_offline));
+}
+
+#[test]
+fn test_filter_online_players() {
+    let mut world: HashMap<Uuid, PlayerState> = HashMap::new();
+    let mut last_seen: HashMap<Uuid, Instant> = HashMap::new();
+    
+    let uuid_online = Uuid::new_v4();
+    let uuid_offline = Uuid::new_v4();
+    let uuid_never_active = Uuid::new_v4();
+    
     world.insert(uuid_online, empty_player("online_player"));
     world.insert(uuid_offline, empty_player("offline_player"));
+    world.insert(uuid_never_active, empty_player("never_active"));
     
-    online_status.insert(uuid_online, true);
-    online_status.insert(uuid_offline, false);
+    let now = Instant::now();
+    last_seen.insert(uuid_online, now);
+    last_seen.insert(uuid_offline, now - Duration::from_secs(61));
+    // uuid_never_active 没有 last_seen 记录
     
-    // 过滤在线玩家（模拟 broadcast_world 的行为）
+    // 过滤在线玩家
     let online_players: Vec<Uuid> = world
         .keys()
-        .filter(|uuid| online_status.get(uuid).copied().unwrap_or(false))
+        .filter(|uuid| {
+            last_seen.get(uuid)
+                .map(|&t| now.duration_since(t).as_secs() < 60)
+                .unwrap_or(false)
+        })
         .cloned()
         .collect();
     
     assert_eq!(online_players.len(), 1);
     assert!(online_players.contains(&uuid_online));
     assert!(!online_players.contains(&uuid_offline));
+    assert!(!online_players.contains(&uuid_never_active));
 }
 
+#[test]
+fn test_player_resume_from_world() {
+    let mut world = WorldState {
+        players: HashMap::new(),
+    };
+    
+    let uuid = Uuid::new_v4();
+    let mut player = empty_player("resumable_player");
+    player.uuid = uuid;
+    player.x = Some(100.0);
+    player.y = Some(200.0);
+    player.z = Some(300.0);
+    
+    world.players.insert(uuid, player.clone());
+    
+    // 模拟玩家恢复
+    let resumed = world.players.get(&uuid);
+    assert!(resumed.is_some());
+    
+    let resumed_player = resumed.unwrap();
+    assert_eq!(resumed_player.username, "resumable_player");
+    assert_eq!(resumed_player.x, Some(100.0));
+    assert_eq!(resumed_player.y, Some(200.0));
+    assert_eq!(resumed_player.z, Some(300.0));
+}
+
+// ============================================================================
+// 性能测试：在线判断
+// ============================================================================
+
+#[test]
+fn test_online_check_performance() {
+    let mut last_seen: HashMap<Uuid, Instant> = HashMap::new();
+    let now = Instant::now();
+    
+    // 创建 1000 个玩家
+    for _ in 0..1000 {
+        let uuid = Uuid::new_v4();
+        // 随机分配在线/离线状态
+        let offset = (uuid.as_u128() % 120) as u64;
+        last_seen.insert(uuid, now - Duration::from_secs(offset));
+    }
+    
+    // 测试判断速度
+    let start = Instant::now();
+    let online_count = last_seen
+        .iter()
+        .filter(|(_, &t)| now.duration_since(t).as_secs() < 60)
+        .count();
+    let elapsed = start.elapsed();
+    
+    println!("在线判断 1000 个玩家耗时: {:?}", elapsed);
+    assert!(elapsed < Duration::from_millis(10)); // 应该很快
+    assert!(online_count > 0 && online_count < 1000);
+}
+
+// ============================================================================
+// UUID 恢复逻辑集成测试
+// ============================================================================
+
+/// 辅助函数：创建测试用的 UDP socket 并发送消息
+fn send_and_receive(message: Value, timeout_secs: u64) -> Result<Value, String> {
+    let socket = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("Bind failed: {}", e))?;
+    socket
+        .set_read_timeout(Some(Duration::from_secs(timeout_secs)))
+        .map_err(|e| format!("Set timeout failed: {}", e))?;
+
+    let server_addr = "127.0.0.1:8888";
+    let msg_str = message.to_string();
+    socket
+        .send_to(msg_str.as_bytes(), server_addr)
+        .map_err(|e| format!("Send failed: {}", e))?;
+
+    let mut buf = [0u8; 4096];
+    match socket.recv_from(&mut buf) {
+        Ok((n, _)) => {
+            let response = String::from_utf8_lossy(&buf[..n]);
+            serde_json::from_str(&response).map_err(|e| format!("Parse failed: {}", e))
+        }
+        Err(e) => Err(format!("Receive failed: {}", e)),
+    }
+}
+
+#[test]
+#[ignore] // 需要运行服务器才能测试
+fn test_uuid_not_found() {
+    // 测试：提供一个不存在的 UUID，不提供用户名
+    let fake_uuid = "00000000-0000-0000-0000-000000000001";
+    let request = json!({
+        "type": "register",
+        "uuid": fake_uuid
+    });
+
+    match send_and_receive(request, 2) {
+        Ok(response) => {
+            assert_eq!(
+                response.get("action").and_then(|v| v.as_str()),
+                Some("uuid_not_found"),
+                "服务器应该返回 uuid_not_found"
+            );
+            assert_eq!(
+                response.get("uuid").and_then(|v| v.as_str()),
+                Some(fake_uuid),
+                "响应应该包含原始 UUID"
+            );
+        }
+        Err(e) => panic!("测试失败: {}", e),
+    }
+}
+
+#[test]
+#[ignore] // 需要运行服务器才能测试
+fn test_username_required() {
+    // 测试：既不提供 UUID 也不提供用户名
+    let request = json!({
+        "type": "register"
+    });
+
+    match send_and_receive(request, 2) {
+        Ok(response) => {
+            assert_eq!(
+                response.get("action").and_then(|v| v.as_str()),
+                Some("username_required"),
+                "服务器应该返回 username_required"
+            );
+        }
+        Err(e) => panic!("测试失败: {}", e),
+    }
+}
+
+#[test]
+#[ignore] // 需要运行服务器才能测试
+fn test_normal_registration() {
+    // 测试：正常注册（提供用户名）
+    let username = format!("test_user_{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs());
+    
+    let request = json!({
+        "type": "register",
+        "username": username
+    });
+
+    match send_and_receive(request, 2) {
+        Ok(response) => {
+            assert_eq!(
+                response.get("action").and_then(|v| v.as_str()),
+                Some("registered"),
+                "服务器应该返回 registered"
+            );
+            assert!(
+                response.get("uuid").is_some(),
+                "响应应该包含 UUID"
+            );
+            assert_eq!(
+                response.get("username").and_then(|v| v.as_str()),
+                Some(username.as_str()),
+                "响应应该包含用户名"
+            );
+        }
+        Err(e) => panic!("测试失败: {}", e),
+    }
+}
+
+#[test]
+#[ignore] // 需要运行服务器才能测试
+fn test_valid_uuid_resume() {
+    // 测试：先注册，然后使用有效的 UUID 恢复
+    let username = format!("resume_test_{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs());
+    
+    // 第一步：注册
+    let register_request = json!({
+        "type": "register",
+        "username": username
+    });
+
+    let uuid = match send_and_receive(register_request, 2) {
+        Ok(response) => {
+            response.get("uuid")
+                .and_then(|v| v.as_str())
+                .expect("应该返回 UUID")
+                .to_string()
+        }
+        Err(e) => panic!("注册失败: {}", e),
+    };
+
+    // 第二步：使用 UUID 恢复
+    let resume_request = json!({
+        "type": "register",
+        "uuid": uuid
+    });
+
+    match send_and_receive(resume_request, 2) {
+        Ok(response) => {
+            assert_eq!(
+                response.get("action").and_then(|v| v.as_str()),
+                Some("registered"),
+                "服务器应该返回 registered"
+            );
+            assert_eq!(
+                response.get("resumed").and_then(|v| v.as_bool()),
+                Some(true),
+                "响应应该标记为 resumed"
+            );
+            assert_eq!(
+                response.get("username").and_then(|v| v.as_str()),
+                Some(username.as_str()),
+                "响应应该包含原始用户名"
+            );
+        }
+        Err(e) => panic!("恢复测试失败: {}", e),
+    }
+}
+
+#[test]
+#[ignore] // 需要运行服务器才能测试
+fn test_malformed_uuid() {
+    // 测试：提供格式错误的 UUID
+    let request = json!({
+        "type": "register",
+        "uuid": "this-is-not-a-valid-uuid"
+    });
+
+    match send_and_receive(request, 2) {
+        Ok(response) => {
+            // 格式错误的 UUID 会被解析失败，服务器会要求提供用户名
+            assert_eq!(
+                response.get("action").and_then(|v| v.as_str()),
+                Some("username_required"),
+                "服务器应该返回 username_required（因为 UUID 解析失败）"
+            );
+        }
+        Err(e) => panic!("测试失败: {}", e),
+    }
+}
+
+#[test]
+#[ignore] // 需要运行服务器才能测试
+fn test_uuid_with_username_invalid_uuid() {
+    // 测试：同时提供 UUID 和用户名，但 UUID 不存在
+    // 服务器应该优先检查 UUID，返回 uuid_not_found
+    let fake_uuid = "11111111-1111-1111-1111-111111111111";
+    let request = json!({
+        "type": "register",
+        "uuid": fake_uuid,
+        "username": "should_not_be_used"
+    });
+
+    match send_and_receive(request, 2) {
+        Ok(response) => {
+            assert_eq!(
+                response.get("action").and_then(|v| v.as_str()),
+                Some("uuid_not_found"),
+                "服务器应该优先检查 UUID，返回 uuid_not_found"
+            );
+        }
+        Err(e) => panic!("测试失败: {}", e),
+    }
+}
